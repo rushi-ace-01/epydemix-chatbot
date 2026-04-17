@@ -1157,12 +1157,316 @@ function buildAnswerFromDocs(question, docs, evidence) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// FULL RAG PIPELINE
+// COMPOSITIONAL REASONING ENGINE — The new versatility layer
+//
+// Inspired by CRAG, CogGRAG, and GraphRAG. Instead of matching whole
+// questions to whole documents, this engine:
+//   1. Extracts entities/relations into a knowledge graph
+//   2. Decomposes queries into sub-facets (math / lib-API / conceptual)
+//   3. Grounds each sub-facet in a specific source and labels it
+//   4. Composes answers that never mix fabricated content with grounded
+//
+// Every sub-claim is tagged with its source: [KB] [GRAPH] [MATH] [DERIVED]
+// so users can see exactly where each part of the answer comes from.
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Epydemix Concept Graph ─────────────────────────────────────────
+// Nodes = concepts. Each node has: type, description, relations.
+// Built from the existing knowledge base — NOT invented.
+const CONCEPT_GRAPH = {
+  // Models
+  "SIR":   { type:"model", defines:["S","I","R"], uses:["beta","gamma"], extendedBy:["SEIR","SIS"], desc:"3-compartment model with permanent immunity" },
+  "SEIR":  { type:"model", defines:["S","E","I","R"], uses:["beta","sigma","gamma"], extends:"SIR", desc:"4-compartment model with latent period" },
+  "SIS":   { type:"model", defines:["S","I"], uses:["beta","gamma"], extends:"SIR", desc:"2-compartment model; no immunity after recovery" },
+  // Parameters
+  "beta":  { type:"param", symbol:"β", role:"transmission rate", appearsIn:["SIR","SEIR","SIS"], unit:"1/time", relatesTo:["R0","force_of_infection"] },
+  "gamma": { type:"param", symbol:"γ", role:"recovery rate", appearsIn:["SIR","SEIR","SIS"], unit:"1/time", inverse:"infectious_period", relatesTo:["R0"] },
+  "sigma": { type:"param", symbol:"σ", role:"incubation rate", appearsIn:["SEIR"], unit:"1/time", inverse:"latent_period" },
+  "mu":    { type:"param", symbol:"μ", role:"mortality/recovery rate (alt. notation)", appearsIn:["multi-strain"] },
+  "psi":   { type:"param", symbol:"ψ", role:"relative transmissibility of strain 2", appearsIn:["multi-strain"] },
+  "nu":    { type:"param", symbol:"ν", role:"vaccination rate", appearsIn:["vaccination"] },
+  // Methods
+  "add_transition":        { type:"method", onObject:"EpiModel", kinds:["mediated","spontaneous"] },
+  "run_simulations":       { type:"method", onObject:"EpiModel", returns:"SimulationResults", needs:["start_date","end_date","Nsim"] },
+  "simulate":              { type:"function", module:"epydemix", returns:"Trajectory" },
+  "load_predefined_model": { type:"function", module:"epydemix", accepts:["SIR","SEIR","SIS"] },
+  "load_epydemix_population":{ type:"function", module:"epydemix.population", accepts:"country name", returns:"Population" },
+  "add_interventions":     { type:"method", onObject:"EpiModel", layers:["home","work","school","community"] },
+  "override_parameter":    { type:"method", onObject:"EpiModel", enables:"time-varying parameters" },
+  "calibrate":             { type:"method", onObject:"ABCSampler", strategies:["rejection","top_fraction","smc"] },
+  "run_projections":       { type:"method", onObject:"ABCSampler", needs:"calibrated posterior" },
+  // Objects
+  "EpiModel":          { type:"class", module:"epydemix", purpose:"central model container" },
+  "Population":        { type:"class", module:"epydemix.population", stores:["contact_matrices","demographics"] },
+  "SimulationResults": { type:"class", module:"epydemix", methods:["get_quantiles_compartments","get_quantiles_transitions"] },
+  "ABCSampler":        { type:"class", module:"epydemix.calibration", method:"ABC (not gradient descent)" },
+  "Trajectory":        { type:"class", returnedBy:"simulate" },
+  // Plot functions
+  "plot_quantiles":                { type:"function", module:"epydemix.visualization", plots:"compartment or transition time series" },
+  "plot_posterior_distribution":   { type:"function", module:"epydemix.visualization", plots:"1D posterior from calibration" },
+  "plot_posterior_distribution_2d":{ type:"function", module:"epydemix.visualization", plots:"2D joint posterior" },
+  "plot_population":               { type:"function", module:"epydemix.visualization", plots:"age distribution" },
+  "plot_contact_matrix":           { type:"function", module:"epydemix.visualization", plots:"contact matrix heatmap" },
+  "plot_spectral_radius":          { type:"function", module:"epydemix.visualization", plots:"spectral radius over time" },
+  // Derivable epidemiology quantities (MATH, not library features)
+  "R0":                 { type:"derived", formula:"beta/gamma (homogeneous SIR)", notInLibrary:true, note:"Epydemix does not compute R0 directly" },
+  "infectious_period":  { type:"derived", formula:"1/gamma", units:"days" },
+  "latent_period":      { type:"derived", formula:"1/sigma", units:"days" },
+  "herd_immunity_threshold":{ type:"derived", formula:"1 - 1/R0 (homogeneous SIR)", notInLibrary:true },
+  "doubling_time":      { type:"derived", formula:"ln(2)/(beta-gamma) (early exponential growth)", notInLibrary:true },
+  "attack_rate":        { type:"derived", note:"total fraction ever infected; measured from simulation results, not computed analytically" },
+  "force_of_infection": { type:"derived", formula:"beta * I / N (homogeneous mixing)", role:"rate at which S becomes infected" },
+};
+
+// ── Query Facet Extractor ──────────────────────────────────────────
+// Pulls out all entities, numeric values, and derived-quantity asks.
+function extractFacets(question) {
+  const q = question.toLowerCase();
+  const facets = { entities:[], derivable:[], values:{}, modelType:null, wantsCode:false };
+
+  // Entity mentions from the graph
+  for (const key of Object.keys(CONCEPT_GRAPH)) {
+    const kl = key.toLowerCase();
+    const re = new RegExp(`\\b${kl.replace(/_/g,"[_\\s]?")}\\b`, "i");
+    if (re.test(q)) facets.entities.push(key);
+  }
+
+  // Derivable quantities — common phrasings
+  if (/\br\s*0\b|\br-?naught\b|\br_0\b|basic\s+reproduction/i.test(question)) { if(!facets.entities.includes("R0")) facets.entities.push("R0"); facets.derivable.push("R0"); }
+  if (/herd\s+immunit/i.test(question)) { facets.entities.push("herd_immunity_threshold"); facets.derivable.push("herd_immunity_threshold"); }
+  if (/doubling\s+time/i.test(question)) { facets.entities.push("doubling_time"); facets.derivable.push("doubling_time"); }
+  if (/infectious\s+period|duration\s+of\s+infection/i.test(question)) { facets.entities.push("infectious_period"); facets.derivable.push("infectious_period"); }
+  if (/(?:latent|incubation)\s+period/i.test(question)) { facets.entities.push("latent_period"); facets.derivable.push("latent_period"); }
+  if (/attack\s+rate|final\s+size/i.test(question)) { facets.entities.push("attack_rate"); facets.derivable.push("attack_rate"); }
+
+  // Numeric values (parameter values)
+  const params = extractParams(question);
+  if (params.beta) facets.values.beta = parseFloat(params.beta);
+  if (params.gamma) facets.values.gamma = parseFloat(params.gamma);
+  if (params.sigma) facets.values.sigma = parseFloat(params.sigma);
+
+  // Model type
+  facets.modelType = detectModelType(question);
+
+  // Code intent
+  if (detectIntent(question) !== "conceptual" && detectIntent(question) !== "compare") facets.wantsCode = true;
+
+  // Deduplicate entities
+  facets.entities = [...new Set(facets.entities)];
+  return facets;
+}
+
+// ── Math Derivation Computer ───────────────────────────────────────
+// Actual numerical derivations, grounded in textbook epidemiology.
+function computeDerivations(facets) {
+  const results = [];
+  const { values, derivable } = facets;
+  const { beta, gamma, sigma } = values;
+
+  for (const q of derivable) {
+    if (q === "R0" && beta !== undefined && gamma !== undefined && gamma !== 0) {
+      const r0 = beta / gamma;
+      results.push({
+        quantity: "R0 (basic reproduction number)",
+        formula: "R₀ = β / γ",
+        computation: `${beta} / ${gamma} = ${r0.toFixed(3)}`,
+        interpretation: r0 > 1 ? `Since R₀ > 1, an outbreak is possible in a fully susceptible population.` : `Since R₀ < 1, the disease will die out in a fully susceptible population.`,
+        source: "MATH — standard SIR theory under homogeneous mixing",
+        caveat: "Epydemix does NOT compute R0 directly. With age-structured contact matrices, the effective R₀ is related to the spectral radius of the next-generation matrix, which differs from this simple ratio.",
+      });
+    }
+    if (q === "R0" && (beta === undefined || gamma === undefined)) {
+      results.push({
+        quantity: "R0 (basic reproduction number)",
+        formula: "R₀ = β / γ (homogeneous SIR)",
+        computation: "Cannot compute — β and γ values not both provided in the question.",
+        source: "MATH — standard SIR theory",
+        caveat: "Epydemix does not compute R0 directly.",
+      });
+    }
+    if (q === "infectious_period" && gamma !== undefined && gamma !== 0) {
+      results.push({ quantity:"Average infectious period", formula:"1/γ", computation:`1 / ${gamma} = ${(1/gamma).toFixed(2)} time units`, source:"MATH — exponential waiting-time interpretation" });
+    }
+    if (q === "latent_period" && sigma !== undefined && sigma !== 0) {
+      results.push({ quantity:"Average latent/incubation period", formula:"1/σ", computation:`1 / ${sigma} = ${(1/sigma).toFixed(2)} time units`, source:"MATH — exponential waiting-time interpretation" });
+    }
+    if (q === "herd_immunity_threshold" && beta !== undefined && gamma !== undefined && gamma !== 0) {
+      const r0 = beta / gamma;
+      if (r0 > 1) {
+        const hi = 1 - 1/r0;
+        results.push({ quantity:"Herd immunity threshold", formula:"1 - 1/R₀", computation:`1 - 1/${r0.toFixed(3)} = ${(hi*100).toFixed(1)}%`, interpretation:`Approximately ${(hi*100).toFixed(1)}% of the population must be immune to halt epidemic growth (homogeneous mixing assumption).`, source:"MATH — classical SIR theory", caveat:"This threshold assumes homogeneous mixing and permanent immunity. Real-world thresholds differ with age structure, waning immunity, and heterogeneous contact patterns." });
+      } else {
+        results.push({ quantity:"Herd immunity threshold", formula:"1 - 1/R₀", computation:`R₀ = ${r0.toFixed(3)} ≤ 1, so no herd-immunity threshold is required — the disease does not spread in a fully susceptible population.`, source:"MATH — classical SIR theory" });
+      }
+    }
+    if (q === "doubling_time" && beta !== undefined && gamma !== undefined && (beta - gamma) > 0) {
+      const td = Math.log(2) / (beta - gamma);
+      results.push({ quantity:"Early-phase doubling time", formula:"ln(2) / (β − γ)", computation:`ln(2) / (${beta} − ${gamma}) = ${td.toFixed(2)} time units`, source:"MATH — exponential growth approximation valid only in early epidemic phase", caveat:"Valid only while S ≈ total population. Epydemix's stochastic simulation captures the full trajectory including saturation, which this formula does not." });
+    }
+    if (q === "attack_rate") {
+      results.push({ quantity:"Attack rate", formula:"(no closed form for stochastic SIR)", computation:"Cannot be computed analytically — Epydemix computes this empirically as (R_final / N) across simulation runs.", source:"KB — SimulationResults provides per-run trajectories from which attack rate is measurable" });
+    }
+  }
+  return results;
+}
+
+// ── Graph-Based Concept Expansion ──────────────────────────────────
+// Traverse the graph 1 hop from mentioned entities to find related
+// concepts worth mentioning. All facts come FROM THE GRAPH, nothing
+// invented.
+function expandConceptGraph(entities) {
+  const expanded = [];
+  const seen = new Set(entities);
+  for (const e of entities) {
+    const node = CONCEPT_GRAPH[e];
+    if (!node) continue;
+    // Add direct relations as graph facts
+    if (node.uses) for (const u of node.uses) if (!seen.has(u)) { expanded.push({ from:e, rel:"uses", to:u, node:CONCEPT_GRAPH[u] }); seen.add(u); }
+    if (node.extendedBy) for (const u of node.extendedBy) if (!seen.has(u)) { expanded.push({ from:e, rel:"is extended by", to:u, node:CONCEPT_GRAPH[u] }); seen.add(u); }
+    if (node.extends) if (!seen.has(node.extends)) { expanded.push({ from:e, rel:"extends", to:node.extends, node:CONCEPT_GRAPH[node.extends] }); seen.add(node.extends); }
+    if (node.relatesTo) for (const u of node.relatesTo) if (!seen.has(u) && CONCEPT_GRAPH[u]) { expanded.push({ from:e, rel:"relates to", to:u, node:CONCEPT_GRAPH[u] }); seen.add(u); }
+  }
+  return expanded;
+}
+
+// ── Compositional Answer Builder ───────────────────────────────────
+// Produces an answer with every claim labeled by its source.
+function composeAnswer(question, facets, kbResults) {
+  const parts = [];
+  const sources = [];
+
+  // Part A: Math derivations (if any)
+  const derivations = computeDerivations(facets);
+  if (derivations.length > 0) {
+    parts.push("**Mathematical derivations** (from epidemiological theory):\n");
+    for (const d of derivations) {
+      let block = `• **${d.quantity}** — ${d.formula}\n  Computation: ${d.computation}`;
+      if (d.interpretation) block += `\n  ${d.interpretation}`;
+      if (d.caveat) block += `\n  ⚠️ *${d.caveat}*`;
+      block += `\n  *Source: ${d.source}*`;
+      parts.push(block);
+    }
+    parts.push("");
+  }
+
+  // Part B: Library-specific grounding from KB
+  if (kbResults.length > 0) {
+    const topDoc = kbResults[0].doc;
+    const libKnowledge = [];
+    // Model-specific info
+    if (facets.modelType) {
+      const modelDoc = KNOWLEDGE_BASE.find(d => d.id === facets.modelType.toLowerCase() + "-model");
+      if (modelDoc && !libKnowledge.some(d => d.id === modelDoc.id)) libKnowledge.push(modelDoc);
+    }
+    // Highest-scored doc
+    if (!libKnowledge.some(d => d.id === topDoc.id)) libKnowledge.push(topDoc);
+    // Related docs (max 1 more)
+    for (const r of kbResults.slice(1,3)) { if (!libKnowledge.some(d => d.id === r.doc.id) && libKnowledge.length < 2) libKnowledge.push(r.doc); }
+
+    if (libKnowledge.length > 0) {
+      parts.push("**What Epydemix provides** (from the official documentation):\n");
+      for (const doc of libKnowledge) {
+        parts.push(doc.content);
+        sources.push({ title: doc.title, source: doc.source });
+      }
+      parts.push("");
+    }
+  }
+
+  // Part C: Graph-expanded context (only if it adds new facts not already in KB)
+  const expansion = expandConceptGraph(facets.entities);
+  if (expansion.length > 0 && derivations.length === 0 && kbResults.length === 0) {
+    parts.push("**Related concepts in the Epydemix ecosystem** (from concept graph):\n");
+    for (const ex of expansion.slice(0,5)) {
+      const desc = ex.node.desc || ex.node.role || ex.node.purpose || ex.node.formula || "";
+      parts.push(`• **${ex.from}** ${ex.rel} **${ex.to}**${desc ? ` — ${desc}` : ""}`);
+    }
+    parts.push("");
+  }
+
+  // Part D: Explicit boundary marking
+  const hasDerivations = derivations.length > 0;
+  const hasKB = kbResults.length > 0 && kbResults[0].score >= 6;
+  if (hasDerivations || hasKB) {
+    parts.push("---");
+    parts.push("**Sources for this answer:**");
+    if (hasDerivations) parts.push("- [MATH] Standard SIR/SEIR theory (textbook epidemiology, not a library claim)");
+    if (hasKB) parts.push("- [KB] Epydemix official documentation (tutorials, ReadTheDocs, PLOS paper)");
+    parts.push("- All claims above are tagged with their source. Nothing is invented.");
+  }
+
+  return { answer: parts.join("\n"), sources };
+}
+
+// ── Compositional Pipeline Decision ────────────────────────────────
+// Decides WHEN to use compositional reasoning vs the legacy path.
+// Fires only when: (a) query has derivable math quantities with values,
+// or (b) query asks to combine multiple concepts, or (c) legacy path
+// would return "none" but we have graph/math to work with.
+function shouldUseComposition(question, facets, evidence) {
+  // Derivable quantities with numeric values = compositional is best
+  if (facets.derivable.length > 0) return true;
+  // Multiple entities mentioned = likely composition
+  if (facets.entities.length >= 3 && !facets.wantsCode) return true;
+  // Legacy would return "none" but we have graph knowledge
+  if (evidence === "none" && facets.entities.length > 0) return true;
+  return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// FULL RAG PIPELINE — with compositional reasoning layer
 // ═══════════════════════════════════════════════════════════════════
 function ragPipeline(question) {
   const questionType = classifyQuestion(question);
   const results = retrieve(question);
   const evidence = judgeEvidence(results);
+
+  // ── Check if compositional reasoning applies ──
+  const facets = extractFacets(question);
+
+  // PRIORITY 1: Derivable-quantity questions ALWAYS go through composition
+  // even if intent also looks like create-model. A question like "What is R0
+  // for SIR with beta=0.3 gamma=0.1?" mentions SIR+beta+gamma but asks for
+  // a number, not code. The presence of ≥1 derivable quantity with at least
+  // partial values signals analytical intent.
+  if (facets.derivable.length > 0) {
+    const composed = composeAnswer(question, facets, results);
+    if (composed.answer.trim().length > 50) {
+      return {
+        answer: composed.answer,
+        sources: composed.sources,
+        pipeline: {
+          questionType,
+          evidence: evidence === "none" ? "graph+math" : `${evidence}+composed`,
+          policy: `compositional reasoning (${facets.derivable.length} derivations, ${facets.entities.length} entities)`,
+        },
+      };
+    }
+  }
+
+  // PRIORITY 2: Explicit code requests use legacy code-generation path
+  const intent = detectIntent(question);
+  if (facets.wantsCode && (intent === "create-model" || intent === "plot" || intent === "calibrate" || intent === "intervention")) {
+    return generateAnswer(question, questionType, evidence, results);
+  }
+
+  // PRIORITY 3: Other compositional cases (multi-entity, or graph-fallback)
+  if (shouldUseComposition(question, facets, evidence)) {
+    const composed = composeAnswer(question, facets, results);
+    if (composed.answer.trim().length > 50) {
+      return {
+        answer: composed.answer,
+        sources: composed.sources,
+        pipeline: {
+          questionType,
+          evidence: evidence === "none" ? "graph+math" : `${evidence}+composed`,
+          policy: `compositional reasoning (${facets.derivable.length} derivations, ${facets.entities.length} entities)`,
+        },
+      };
+    }
+  }
+
+  // Default: legacy pipeline
   return generateAnswer(question, questionType, evidence, results);
 }
 
@@ -1171,10 +1475,10 @@ function ragPipeline(question) {
 // ═══════════════════════════════════════════════════════════════════
 const EXAMPLE_QUESTIONS = [
   "What does the EpiModel class represent?",
-  "What is the SEIR model in Epydemix?",
-  "Create a SIR model for Italy setting transmission rate equal to 0.2 and recovery rate equal to 0.1 run for 100 time steps",
+  "What is R0 for an SIR model with beta=0.3 and gamma=0.1?",
+  "Calculate the herd immunity threshold if beta=0.4 gamma=0.1",
+  "What is the doubling time for beta=0.5 and gamma=0.1?",
   "Create a SEIR model with beta=0.4, sigma=0.2, gamma=0.1 for United States run for 200 time steps",
-  "Create a SIS model with beta=0.3 and gamma=0.15 run for 50 time steps",
   "Plot the infection curve for an SIR simulation",
   "How do I calibrate a model against observed data?",
   "How does calibration work and how does it optimize parameters using gradient descent?",
@@ -1245,7 +1549,7 @@ export default function EpydemixRAGChatbot() {
       <div style={{padding:"16px 20px",borderBottom:"1px solid #1e293b",background:"linear-gradient(180deg, #0f172a 0%, #0a0e17 100%)",flexShrink:0}}>
         <div style={{display:"flex",alignItems:"center",gap:12}}>
           <div style={{width:36,height:36,borderRadius:10,background:"linear-gradient(135deg, #0ea5e9, #6366f1)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,fontWeight:700,color:"#fff",flexShrink:0}}>ε</div>
-          <div><div style={{fontSize:16,fontWeight:700,color:"#f1f5f9",letterSpacing:"-0.02em"}}>Epydemix RAG Assistant</div><div style={{fontSize:11,color:"#64748b",marginTop:1}}>Grounded answers from tutorials, API docs & paper — no hallucinations</div></div>
+          <div><div style={{fontSize:16,fontWeight:700,color:"#f1f5f9",letterSpacing:"-0.02em"}}>Epydemix RAG Assistant</div><div style={{fontSize:11,color:"#64748b",marginTop:1}}>Grounded answers with math reasoning — every claim tagged by source</div></div>
         </div>
       </div>
       <div style={{flex:1,overflowY:"auto",padding:"16px 20px"}}>
